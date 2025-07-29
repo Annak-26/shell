@@ -1,0 +1,548 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <sys/types.h>
+#include <sys/file.h>
+
+#define END     0
+#define COMMAND 1
+#define BRANCH  2
+#define CONV    3
+#define LOG_AND 4
+#define LOG_OR  5
+#define TZPT    6
+#define PHONE   7
+
+char* type_to_str(int type) {
+    if (type == COMMAND) {
+        return "COMMAND";
+    }
+    if (type == BRANCH) {
+        return "BRANCH";
+    }
+    if (type == CONV) {
+        return "CONV";
+    }
+    if (type == LOG_AND) {
+        return "LOG_AND";
+    }
+    if (type == LOG_OR) {
+        return "LOG_OR";
+    }
+    if (type == TZPT) {
+        return "TZPT";
+    }
+    if (type == PHONE) {
+        return "PHONE";
+    }
+    printf("ERROR! UNKNOWN TYPE!");
+    exit(1);
+}
+
+int IS_CHILD(int x) { return x == COMMAND || x == BRANCH; }
+int IS_NOT_CHILD(int x) { return !IS_CHILD(x); }
+int IS_CONV(int x) { return x == CONV; }
+int IS_LOG(int x) { return x == LOG_AND || x == LOG_OR; }
+int IS_DELIMITER(int x) { return x == TZPT || x == PHONE; }
+
+int is_special(char c) { return c == '|' || c == '&' || c == ';'; }
+int is_alpha(char c) { return !is_special(c); }
+int is_io(char c) { return c == '<' || c == '>'; }
+
+struct ParserElem {
+    int type;
+    char *raw_str;
+    char **argv;
+    struct ParserElem *branched;
+    // файлы перенаправления
+    char* in;
+    char* out;
+    int add_to_file;
+};
+
+
+typedef struct ParserElem * pPointer;
+void execute_1(pPointer begin);
+
+int OTSTUP;
+void print_parser(pPointer p) {
+    char c_otstup[OTSTUP+1];
+    for (int i = 0; i < OTSTUP; i++)
+        c_otstup[i] = ' ';
+    c_otstup[OTSTUP] = '\0';
+    
+    printf("%s{\n", c_otstup);
+    printf("%s    %s\n", c_otstup, type_to_str(p->type));
+    if (p->raw_str) {
+        printf("%s    RAW: %s\n", c_otstup, p->raw_str);
+    }
+    if (p->argv){
+        char **c = p->argv;
+        int i = 0;
+        while (c[i]) {
+            printf("%s    ARGV: %s\n", c_otstup, c[i]);
+            i++;
+        }
+        printf("%s    ARGV: NULL\n", c_otstup);
+    }
+    if (p->in) {
+        printf("%s    IN: %s\n", c_otstup, p->in);
+    }
+    if (p->out) {
+        char *c = "with append";
+        if (!p->add_to_file)
+            c = "";
+        printf("%s    OUT: %s %s\n", c_otstup, p->out, c);
+    }
+    printf("%s}\n", c_otstup);
+}
+
+
+void free_parser(pPointer p) {
+    free(p->raw_str);
+    free(p->branched);
+    if (p->argv) {
+        int i = 0;
+        while (p->argv[i]) {
+            free(p->argv[i]);
+            ++i;
+        }
+        free(p->argv);
+    }
+    free(p->in);
+    free(p->out);
+}
+
+
+void free_array(pPointer arr) {
+    for (pPointer p = arr; p->type != END; p++) {
+        if (p->branched == NULL) {
+            free_parser(p);
+        } else {
+            free_array(p->branched);
+            p->branched = NULL;
+            free_parser(p);
+        }
+    }
+    free(arr);
+}
+
+
+char *make_mem(char *begin, char *end) {
+    int len = end - begin;
+    char *ans = (char*)malloc(len + 1);
+    memcpy(ans, begin, len);
+    ans[len] = '\0';
+    return ans;
+}
+
+
+char *split(char *s) {
+    while (*s == ' ')
+        ++s;
+    if (*s == '\0')
+        return NULL;
+    int cnt = 0;
+    while (*s != '\0') {
+        if (*s == '(')
+            cnt++;
+        if (*s == ')')
+            cnt--;
+        if (cnt == 0 && is_special(*s))
+            break;
+        ++s;
+    }
+    return s;
+}
+
+
+char** make_argv(char *s) { 
+    char *c = s;
+    int argc = 0;
+
+    // считаем число слов
+    while (1) {
+        while (*c == ' ')
+            c += 1;
+        if (*c == '\0')
+            break;
+        while (*c != ' ' && *c != '\0')
+            c += 1;
+        argc += 1;
+    }
+
+    char **argv = (char**)malloc(sizeof(char *) * (argc + 1));
+    argv[argc] = NULL;
+
+    c = s;
+    for (int i = 0; i < argc; i += 1) {
+        while (*c == ' ')
+            c += 1;
+
+        char *begin = c;
+        while (*c != '\0' && *c != ' ')
+            c += 1;
+
+        argv[i] = make_mem(begin, c);
+
+        c += 1;
+    }
+
+    return argv;
+}
+
+
+void init_mem(pPointer p, int type, char *s) {
+    p->type = type;
+    p->raw_str = s;
+    p->argv = NULL;
+    p->branched = NULL;
+    p->in = NULL;
+    p->out = NULL;
+    p->add_to_file = 0;
+}
+
+
+struct ParserElem parsed_str[1024];
+
+
+int format_branches(char *s) {
+    if (s == NULL)
+        return 0;
+    char *c = s;
+    while (*c != '\0' && *c != '(')
+        c++;
+    if (*c == '\0')
+        return 0;
+    s = c + 1;
+    while (*s != '\0')
+        s++;
+    while (*s != ')')
+        s--;
+    *c = ' ';
+    *s = ' ';
+    return 1;
+}
+
+
+char *find_io_redirect(char *s) {
+    int cnt = 0;
+    while (*s != '\0') {
+        if (*s == '(')
+            cnt++;
+        if (*s == ')')
+            cnt--;
+        if (cnt == 0 && is_io(*s))
+            return s;
+        ++s;
+    }
+    return NULL;
+}
+
+
+void io_redirect(pPointer p) {
+    if (p->raw_str == NULL)
+        return;
+    char *s = p->raw_str;
+    while ((s = find_io_redirect(p->raw_str))) {
+        char c = *s;
+        *s = ' ';
+        if (c == '>') {
+            s++;
+            if (*s == '>') {
+                *s = ' ';
+                p->add_to_file = 1;
+            }
+        }
+        while (*s == ' ')
+            s++;
+
+        char *begin = s;
+        while (*s != '\0' && is_alpha(*s) && *s != ' ')
+            s++;
+
+        char *file = make_mem(begin, s);
+        
+        while (begin < s) {
+            *begin = ' ';
+            begin++;
+        }
+
+        if (c == '<')
+            p->in = file;
+        else
+            p->out = file;
+    }
+}
+
+
+pPointer parse_str(char *input) {
+    char *begin = input;
+    int n = 0;
+    while (*begin != '\0') {
+        char *end = split(begin);
+        if (end == NULL)
+            break;
+
+        init_mem(&parsed_str[n++], COMMAND, make_mem(begin, end));
+
+        char c = *end;
+        if (c == '\0')
+            break;
+
+        if (c == ';') {
+            init_mem(&parsed_str[n++], TZPT, NULL);
+            begin = end + 1;
+            continue;
+        }
+
+        if (c == '&') {
+            end++;
+            if (*end == '&') {
+                init_mem(&parsed_str[n++], LOG_AND, NULL);
+                begin = end + 1;
+            } else {
+                init_mem(&parsed_str[n++], PHONE, NULL);
+                begin = end;
+            }
+            continue;
+        }
+
+        if (c == '|') {
+            end++;
+            if (*end == '|') {
+                init_mem(&parsed_str[n++], LOG_OR, NULL);
+                begin = end + 1;
+            } else {
+                init_mem(&parsed_str[n++], CONV, NULL);
+                begin = end;
+            }
+            continue;
+        }
+    }
+
+    init_mem(&parsed_str[n++], END, NULL);
+    pPointer answer = (pPointer)malloc(sizeof(struct ParserElem) * (n+1));
+    memcpy(answer, parsed_str, sizeof(struct ParserElem) * (n+1));
+
+    for (pPointer p = answer; p->type != END; p++) {
+        io_redirect(p);
+        if (p->type == COMMAND) {
+            p->argv = make_argv(p->raw_str);
+            free(p->raw_str);
+            p->raw_str = NULL;
+        }
+        print_parser(p);
+    }
+
+    return answer;
+}
+
+
+int change_dir(char *s) {
+    if ( s[0] == '/' ) {
+        return chdir(s);
+    } else {
+        // not abs path
+        char current_path[4096];
+        getcwd(current_path, 4095);
+        strcat(current_path,"/");
+        strcat(current_path, s);
+        return chdir(current_path);
+    }
+}
+
+
+void redirect_input_output(pPointer p, int descriptor_in, int descriptor_out, int descriptor_unused) {
+    if (descriptor_unused != -2) {
+        close(descriptor_unused);
+    }
+
+    if (descriptor_in != -2) {
+        dup2(descriptor_in, 0);
+        close(descriptor_in);
+    } else if (p->in != NULL) {
+        int file_desc = open(p->in, O_RDONLY);
+        if (file_desc == -1) {
+            file_desc = open("/dev/null", O_RDONLY);
+            fprintf(stderr, "NO SUCH FILE TO READ: %s\n", p->in);
+        }
+        dup2(file_desc, 0);
+    }
+
+    if (descriptor_out != -2) {
+        dup2(descriptor_out, 1);
+        close(descriptor_out);
+    } else if (p->out != NULL) {
+        int file_desc;
+        if (p->add_to_file == 0)
+            file_desc = open(p->out, O_WRONLY | O_CREAT | O_TRUNC, 0640);
+        else
+            file_desc = open(p->out, O_WRONLY | O_CREAT | O_APPEND, 0640);
+        if (file_desc == -1) {
+            file_desc = open("/dev/null", O_RDONLY);
+            fprintf(stderr, "NO SUCH FILE TO WRITE: %s\n", p->out);
+        }
+        dup2(file_desc, 1);
+    }
+}
+
+
+int execute_3(pPointer begin, pPointer end) {
+    int child_cnt = 0;
+    for (pPointer p = begin; p != end; p++)
+        if (IS_CHILD(p->type))
+            child_cnt++;
+
+    int pids[child_cnt];
+
+    if ( child_cnt == 1 )
+        if (begin->argv != NULL)
+            if (strcmp(begin->argv[0], "cd") == 0)
+                return change_dir(begin->argv[1]);
+    
+    int fd[2], fd_p;
+    fd_p = -2;
+    fd[0] = -2;
+    fd[1] = -2;
+    pPointer p = begin;
+
+    for (int i = 0; i < child_cnt; i += 1) {
+        while (IS_NOT_CHILD(p->type))
+            p++;
+
+        if (i != child_cnt - 1)
+            pipe(fd);
+
+        if ((pids[i] = fork()) == 0) {
+            redirect_input_output(p, fd_p, fd[1], fd[0]);
+
+            if (p->branched) {
+                execute_1(p->branched);
+                exit(0);
+            }
+
+            execvp(p->argv[0], p->argv);
+            fprintf(stderr, "error: no command <%s>\n", p->argv[0]);
+            exit(1);
+        }
+
+        p++;
+
+        if (child_cnt != 1) {
+            if (i == 0) {
+                fd_p = fd[0];
+                fd[0] = -2;
+                close(fd[1]);
+                fd[1] = -2;
+            } else if (i == child_cnt - 1) {
+                close(fd_p);
+                fd_p = -2;
+            } else {
+                close(fd_p);
+                fd_p = fd[0];
+                fd[0] = -2;
+                close(fd[1]);
+                fd[1] = -2;
+            }
+        }
+    }
+
+    int k;
+    for (int i = 0; i < child_cnt; i += 1)
+        waitpid(pids[i], &k, 0);
+    return k;
+
+    return 0;
+}
+
+
+void execute_2(pPointer begin, pPointer end) {
+    pPointer p = begin;
+    while (p != end) {
+        begin = p;
+        while (p != end && !IS_DELIMITER(p->type) && !IS_LOG(p->type))
+            p++;
+
+        int status = execute_3(begin, p);
+
+        if (p == end)
+            break;
+        if (status != 0 && p->type == LOG_AND)
+            break;
+        if (status == 0 && p->type == LOG_OR)
+            break;
+
+        p++;
+    }
+}
+
+
+void execute_1(pPointer begin) {
+    pPointer p = begin;
+    while (p->type != END) {
+        begin = p;
+        while (p->type != END && !IS_DELIMITER(p->type))
+            p++;
+
+        if (p->type != PHONE) {
+            execute_2(begin, p);
+        } else {
+		int k;
+		if ((k = fork()) == 0) {
+			if (!fork()) {
+				k = open("/dev/null", O_RDONLY);
+				dup2(k, 0);
+				close(k);
+
+                    		signal(SIGINT, SIG_IGN);
+				execute_2(begin, p);
+				exit(0);
+				}
+				exit(0);
+			}
+			waitpid(k, NULL, 0);
+        }
+
+        if (p->type == END)
+            break;
+        p++;
+    }
+}
+
+
+int input_string(char *s) {
+    while (1) {
+        int c = getchar();
+        if (c == '\n' || c == EOF) {
+            *s = '\0';
+            return c == EOF ? 1 : 0;
+        }
+        *s = c;
+        s++;
+    }
+}
+
+
+char query[4096];
+char current_path[4096];
+int main(int argc, char **argv) {
+
+    while (1) {
+
+        getcwd(current_path,4095);
+        printf("%s$ ", current_path);
+        int ret = input_string(query);
+    
+        if (strcmp(query,"exit") == 0 || query[0] == '\0') {
+            putchar('\n');
+            return 0;
+        }
+
+        pPointer parsed = parse_str(query);
+        execute_1(parsed);
+        free_array(parsed);
+    }
+}
